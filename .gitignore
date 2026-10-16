@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Local secrets and mailer config (use mailer/mailer.example.yml)
+.env
+.env.*
+mailer/mailer.yml
+
+# Cloud Custodian run output (-s paths from README)
+logs/
+output/
+
+# Repo-local temp (see tmp/README.md); keep placeholder files only
+tmp/*
+!tmp/.gitkeep
+!tmp/README.md
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~

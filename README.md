@@ -143,3 +143,18 @@ Refer to the [Cloud Custodian documentation](https://cloudcustodian.io/docs/inde
 ## Contributing
 
 More examples will be added over time. If you use or extend a policy here, treat it as sample code: test in a non-production account before rolling out broadly.
+
+### CI and local tests (Moto)
+
+GitHub Actions workflow **Custodian policies (Moto)** runs on **pull requests** and **manual dispatch** (`workflow_dispatch`). It validates every policy YAML and dry-runs policies in-process against [Moto](https://github.com/getmoto/moto) (no AWS credentials). Service quota policies are validate-only because Moto does not implement the Service Quotas API.
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+Local Custodian output can go under **`tmp/`** (gitignored except `tmp/README.md`):
+
+```bash
+custodian run -s tmp/c7n-out -r us-east-1 policies/aws/off-hours/ec2-offhours-schedule.yml
+```
