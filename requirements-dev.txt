@@ -1,0 +1,4 @@
+# CI and local policy tests (see .github/workflows/custodian-policies.yml)
+c7n>=0.9.50
+moto[ec2,iam,rds,elbv2,s3]>=5.0
+pytest>=7.0
