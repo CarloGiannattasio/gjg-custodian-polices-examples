@@ -1,0 +1,188 @@
+# Unused IAM role cleanup (global — run in us-east-1, e.g. -r us-east-1)
+#
+# Timeline (unused = not used on EC2/Lambda/ECS and no service last-access in 365d):
+#   1. Role age > 1 year → notify + mark delete in 21 days (c7n_iam_role_idle)
+#   2. Day 7  → second notify (marked-for-op skew 14)
+#   3. Day 14 → disable (detach managed policies) + re-mark delete in 7 days + notify
+#   4. Day 21 → delete (force) + notify
+#
+# Mailer: mailer/mailer.example.yml
+# Opt-out: custodian_iam_role_idle_exempt | custodian_iam_role_idle_ignore
+#
+# Skips AWS service roles (Path /aws-service-role/). Inline policies removed on delete (force).
+
+vars:
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+  role-age-1y: &role-age-1y
+    type: value
+    key: CreateDate
+    value_type: age
+    value: 365
+    op: greater-than
+
+  not-aws-service-role: &not-aws-service-role
+    type: value
+    key: Path
+    op: not-in
+    value:
+      - /aws-service-role/
+
+  role-used: &role-used
+    type: used
+    state: true
+
+policies:
+  - name: iam-role-idle-mark-year-notify
+    resource: iam-role
+    description: |
+      Unused roles older than 1 year — initial notify and schedule (21-day lifecycle mark).
+    filters:
+      - "tag:custodian_iam_role_idle_exempt": absent
+      - "tag:custodian_iam_role_idle_ignore": absent
+      - <<: *not-aws-service-role
+      - <<: *role-age-1y
+      - type: used
+        state: false
+      - type: usage
+        match-operator: all
+        LastAuthenticated: null
+      - "tag:c7n_iam_role_idle_1y": absent
+      - "tag:c7n_iam_role_idle": absent
+    actions:
+      - type: tag
+        tags:
+          c7n_iam_role_idle_1y: "true"
+      - type: mark-for-op
+        tag: c7n_iam_role_idle
+        op: delete
+        days: 21
+      - <<: *notify-base
+        subject: "IAM role unused 1y+ — {{ RoleName }}"
+        violation_desc: "IAM role is over 1 year old and appears unused."
+        action_desc: |
+          Lifecycle started. You will receive another notice in 7 days unless the role is used.
+          Tag custodian_iam_role_idle_exempt or custodian_iam_role_idle_ignore to opt out.
+
+  - name: iam-role-idle-notify-7d
+    resource: iam-role
+    description: Second notice 7 days into the 21-day lifecycle mark.
+    filters:
+      - "tag:custodian_iam_role_idle_exempt": absent
+      - "tag:custodian_iam_role_idle_ignore": absent
+      - <<: *not-aws-service-role
+      - "tag:c7n_iam_role_idle": present
+      - type: marked-for-op
+        tag: c7n_iam_role_idle
+        op: delete
+        skew: 14
+      - type: used
+        state: false
+      - type: usage
+        match-operator: all
+        LastAuthenticated: null
+    actions:
+      - <<: *notify-base
+        subject: "IAM role unused — 7-day reminder — {{ RoleName }}"
+        violation_desc: "Unused IAM role — one week into the cleanup timeline."
+        action_desc: |
+          In 7 days the role will be disabled (managed policies detached) and re-marked for
+          deletion 7 days later unless usage is detected.
+
+  - name: iam-role-idle-disable-mark-delete-7d
+    resource: iam-role
+    description: Disable role (detach policies) and mark deletion in 7 days.
+    filters:
+      - "tag:custodian_iam_role_idle_exempt": absent
+      - "tag:custodian_iam_role_idle_ignore": absent
+      - <<: *not-aws-service-role
+      - "tag:c7n_iam_role_idle": present
+      - type: marked-for-op
+        tag: c7n_iam_role_idle
+        op: delete
+        skew: 7
+      - type: used
+        state: false
+      - type: usage
+        match-operator: all
+        LastAuthenticated: null
+    actions:
+      - type: set-policy
+        state: detached
+        arn: "*"
+      - type: tag
+        tags:
+          c7n_iam_role_disabled: "true"
+      - type: remove-tag
+        tags:
+          - c7n_iam_role_idle
+      - type: mark-for-op
+        tag: c7n_iam_role_idle
+        op: delete
+        days: 7
+      - <<: *notify-base
+        subject: "IAM role disabled — delete in 7 days — {{ RoleName }}"
+        violation_desc: "Unused IAM role had managed policies detached (disabled)."
+        action_desc: |
+          Role marked for deletion in 7 days. Inline policies are removed on delete (force).
+
+  - name: iam-role-idle-delete
+    resource: iam-role
+    description: Delete unused roles when the delete mark matures.
+    filters:
+      - "tag:custodian_iam_role_idle_exempt": absent
+      - "tag:custodian_iam_role_idle_ignore": absent
+      - <<: *not-aws-service-role
+      - "tag:c7n_iam_role_idle": present
+      - type: marked-for-op
+        tag: c7n_iam_role_idle
+        op: delete
+      - type: used
+        state: false
+      - type: usage
+        match-operator: all
+        LastAuthenticated: null
+    actions:
+      - type: delete
+        force: true
+      - <<: *notify-base
+        subject: "IAM role deleted (unused) — {{ RoleName }}"
+        violation_desc: "Unused IAM role reached scheduled deletion."
+        action_desc: "Role deleted with force (policies and instance profiles cleaned up)."
+
+  - name: iam-role-idle-unmark-on-use
+    resource: iam-role
+    description: Clear idle tags if the role is used on EC2, Lambda, or ECS again.
+    filters:
+      - "tag:custodian_iam_role_idle_exempt": absent
+      - "tag:custodian_iam_role_idle_ignore": absent
+      - or:
+          - "tag:c7n_iam_role_idle": present
+          - "tag:c7n_iam_role_idle_1y": present
+          - "tag:c7n_iam_role_disabled": present
+      - <<: *role-used
+    actions:
+      - type: remove-tag
+        tags:
+          - c7n_iam_role_idle
+          - c7n_iam_role_idle_1y
+          - c7n_iam_role_disabled
+      - <<: *notify-base
+        subject: "IAM role idle cleanup cancelled — {{ RoleName }}"
+        violation_desc: "IAM role shows usage after idle marking."
+        action_desc: "Idle lifecycle tags removed."

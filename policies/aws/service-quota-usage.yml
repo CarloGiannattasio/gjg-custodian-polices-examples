@@ -1,0 +1,81 @@
+# AWS Service Quota usage — policy-only workflow
+#
+# Mailer (Slack + email): mailer/mailer.example.yml — align queue with notify-transport below.
+#
+# Schedule:
+#   • service-quota-discovery-25  — WEEKLY (full account scan ≥ 25%, writes discovery list)
+#   • service-quota-warning-70    — DAILY (reads discovery list, checks ≥ 70%)
+#
+# The daily warning run uses the latest discovery resources.json on disk (refreshed weekly).
+# Run both from the repo root with the same -r mode (-r all recommended).
+#
+# Weekly discovery:
+#   custodian run -s logs/service-quota-discovery -r all \
+#     policies/aws/service-quota-usage.yml --policy service-quota-discovery-25
+#
+# Daily warnings (after at least one weekly discovery has populated logs):
+#   custodian run -s logs/service-quota-warnings -r all \
+#     policies/aws/service-quota-usage.yml --policy service-quota-warning-70
+#
+# Discovery layout (with -r all):
+#   logs/service-quota-discovery/<region>/service-quota-discovery-25/resources.json
+#
+# Single region only (no region suffix on -s): change the warning policy value_from url to:
+#   file://logs/service-quota-discovery/service-quota-discovery-25/resources.json
+
+vars:
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+policies:
+  - name: service-quota-discovery-25
+    resource: aws.service-quota
+    description: |
+      Weekly — Scan the account for service quotas at or above 25% utilization.
+      Results are persisted under -s logs/service-quota-discovery (resources.json, custodian-run.log).
+    filters:
+      - UsageMetric: present
+      - type: usage-metric
+        limit: 25
+    actions:
+      - <<: *notify-base
+        subject: "Service quota ≥25% — {{ ServiceCode }} / {{ QuotaName }} ({{ region }})"
+        violation_desc: "Service quota is at or above 25% utilization."
+        action_desc: |
+          Recorded in weekly discovery logs for follow-up. Daily warning policy checks ≥70%.
+
+  - name: service-quota-warning-70
+    resource: aws.service-quota
+    description: |
+      Daily — Read the weekly discovery list for this region, then flag quotas at or above 70%.
+    filters:
+      - UsageMetric: present
+      - type: value
+        key: QuotaArn
+        op: in
+        value_from:
+          url: file://logs/service-quota-discovery/{region}/service-quota-discovery-25/resources.json
+          format: json
+          expr: "[].QuotaArn"
+      - type: usage-metric
+        limit: 70
+    actions:
+      - <<: *notify-base
+        subject: "WARNING Service quota ≥70% — {{ ServiceCode }} / {{ QuotaName }} ({{ region }})"
+        violation_desc: "Service quota is at or above 70% utilization."
+        action_desc: |
+          Review quota usage and request an increase if needed. Discovery source is the weekly 25% scan.

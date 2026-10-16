@@ -1,0 +1,239 @@
+# ELB idle cleanup — Application/Network (app-elb) and Classic (elb)
+#
+# Timeline (idle = no traffic for the lookback window):
+#   1. 7 days idle  → notify (Slack + email), tag c7n_elb_idle_7d_notice
+#   2. Still idle   → notify + mark-for-op delete in 14 days (tag c7n_elb_idle)
+#   3. Delete date  → delete + notify (skips deletion-protected load balancers)
+#   • Unmark if traffic returns
+#
+# Mailer: mailer/mailer.example.yml (shared). Opt-out tags (any value):
+#   custodian_elb_idle_exempt  |  custodian_elb_idle_ignore
+#
+# Idle metrics:
+#   app-elb Type=application → RequestCount (Sum)
+#   app-elb Type=network     → ProcessedBytes (Sum)
+#   classic elb              → RequestCount (Sum)
+
+vars:
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+  app-elb-idle-7d: &app-elb-idle-7d
+    or:
+      - and:
+          - Type: application
+          - type: metrics
+            name: RequestCount
+            days: 7
+            value: 0
+            op: equal
+            statistics: Sum
+      - and:
+          - Type: network
+          - type: metrics
+            name: ProcessedBytes
+            days: 7
+            value: 0
+            op: equal
+            statistics: Sum
+
+  classic-elb-idle-7d: &classic-elb-idle-7d
+    type: metrics
+    name: RequestCount
+    days: 7
+    value: 0
+    op: equal
+    statistics: Sum
+
+policies:
+  # --- Application / Network Load Balancers (ELBv2) ---
+
+  - name: app-elb-idle-notify-7d
+    resource: app-elb
+    description: Idle 7 days — first Slack/email notice.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle_7d_notice": absent
+      - "tag:c7n_elb_idle": absent
+      - <<: *app-elb-idle-7d
+    actions:
+      - type: tag
+        tags:
+          c7n_elb_idle_7d_notice: "true"
+      - <<: *notify-base
+        subject: "ELB idle 7d — {{ LoadBalancerName }} ({{ region }})"
+        violation_desc: "Load balancer has had no meaningful traffic for 7 days."
+        action_desc: |
+          No deletion scheduled yet. Tag custodian_elb_idle_exempt or
+          custodian_elb_idle_ignore to opt out.
+
+  - name: app-elb-idle-mark-delete-14d
+    resource: app-elb
+    description: Notify and mark for delete in 14 days while still idle.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle_7d_notice": present
+      - "tag:c7n_elb_idle": absent
+      - <<: *app-elb-idle-7d
+    actions:
+      - type: mark-for-op
+        tag: c7n_elb_idle
+        op: delete
+        days: 14
+      - <<: *notify-base
+        subject: "ELB idle — delete in 14 days — {{ LoadBalancerName }}"
+        violation_desc: "Load balancer remains idle after the 7-day notice."
+        action_desc: "Marked for deletion in 14 days (tag c7n_elb_idle)."
+
+  - name: app-elb-idle-delete
+    resource: app-elb
+    description: Delete when mark matures and deletion protection is off.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle": present
+      - type: marked-for-op
+        tag: c7n_elb_idle
+        op: delete
+      - type: attributes
+        key: deletion_protection.enabled
+        value: false
+        op: eq
+      - <<: *app-elb-idle-7d
+    actions:
+      - delete
+      - <<: *notify-base
+        subject: "ELB deleted (idle) — {{ LoadBalancerName }}"
+        violation_desc: "Idle load balancer reached delete date."
+        action_desc: "Application/Network load balancer deleted."
+
+  - name: app-elb-idle-unmark-on-traffic
+    resource: app-elb
+    description: Clear idle tags when traffic returns.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - or:
+          - "tag:c7n_elb_idle": present
+          - "tag:c7n_elb_idle_7d_notice": present
+      - or:
+          - and:
+              - Type: application
+              - type: metrics
+                name: RequestCount
+                days: 7
+                value: 0
+                op: greater-than
+          - and:
+              - Type: network
+              - type: metrics
+                name: ProcessedBytes
+                days: 7
+                value: 0
+                op: greater-than
+    actions:
+      - type: remove-tag
+        tags:
+          - c7n_elb_idle
+          - c7n_elb_idle_7d_notice
+      - <<: *notify-base
+        subject: "ELB idle mark cleared — {{ LoadBalancerName }}"
+        violation_desc: "Traffic detected after idle marking."
+        action_desc: "Idle lifecycle tags removed."
+
+  # --- Classic Load Balancers ---
+
+  - name: elb-idle-notify-7d
+    resource: elb
+    description: Classic ELB idle 7 days — first notice.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle_7d_notice": absent
+      - "tag:c7n_elb_idle": absent
+      - *classic-elb-idle-7d
+    actions:
+      - type: tag
+        tags:
+          c7n_elb_idle_7d_notice: "true"
+      - <<: *notify-base
+        subject: "Classic ELB idle 7d — {{ LoadBalancerName }} ({{ region }})"
+        violation_desc: "Classic load balancer has had no requests for 7 days."
+        action_desc: "Opt out with custodian_elb_idle_exempt or custodian_elb_idle_ignore."
+
+  - name: elb-idle-mark-delete-14d
+    resource: elb
+    description: Classic ELB — mark delete in 14 days while idle.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle_7d_notice": present
+      - "tag:c7n_elb_idle": absent
+      - *classic-elb-idle-7d
+    actions:
+      - type: mark-for-op
+        tag: c7n_elb_idle
+        op: delete
+        days: 14
+      - <<: *notify-base
+        subject: "Classic ELB idle — delete in 14 days — {{ LoadBalancerName }}"
+        violation_desc: "Classic ELB remains idle."
+        action_desc: "Deletion marked in 14 days."
+
+  - name: elb-idle-delete
+    resource: elb
+    description: Delete classic ELB when marked and still idle.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - "tag:c7n_elb_idle": present
+      - type: marked-for-op
+        tag: c7n_elb_idle
+        op: delete
+      - *classic-elb-idle-7d
+    actions:
+      - delete
+      - <<: *notify-base
+        subject: "Classic ELB deleted (idle) — {{ LoadBalancerName }}"
+        violation_desc: "Idle classic load balancer deleted."
+        action_desc: "Classic ELB removed."
+
+  - name: elb-idle-unmark-on-traffic
+    resource: elb
+    description: Clear idle tags on classic ELB when requests resume.
+    filters:
+      - "tag:custodian_elb_idle_exempt": absent
+      - "tag:custodian_elb_idle_ignore": absent
+      - or:
+          - "tag:c7n_elb_idle": present
+          - "tag:c7n_elb_idle_7d_notice": present
+      - type: metrics
+        name: RequestCount
+        days: 7
+        value: 0
+        op: greater-than
+    actions:
+      - type: remove-tag
+        tags:
+          - c7n_elb_idle
+          - c7n_elb_idle_7d_notice
+      - <<: *notify-base
+        subject: "Classic ELB idle mark cleared — {{ LoadBalancerName }}"
+        violation_desc: "RequestCount increased after idle marking."
+        action_desc: "Tags removed."
