@@ -4,7 +4,7 @@
 #   1. 7 days idle  → notify (Slack + email), tag c7n_rds_idle_7d_notice
 #   2. Still idle   → notify + mark-for-op stop in 14 days (tag c7n_rds_idle)
 #   3. Stop date    → if still idle 14d + running, stop, re-mark delete in 30 days, notify
-#   4. Pre-delete   → ensure stopped; Aurora clusters: start 1 hour before delete time
+#   4. Pre-delete   → ensure stopped (2–1 days before delete); Aurora: start 1 day before delete
 #   5. Delete date  → delete (instances must be stopped), notify
 #   • Unmark if connections resume
 #
@@ -45,6 +45,7 @@ vars:
     value: 0
     op: equal
     statistics: Sum
+    missing-value: 0
 
   idle-14-days: &idle-14-days
     type: metrics
@@ -53,6 +54,7 @@ vars:
     value: 0
     op: equal
     statistics: Sum
+    missing-value: 0
 
   not-in-cluster: &not-in-cluster
     type: value
@@ -176,7 +178,6 @@ policies:
         key: DBInstanceStatus
         value: stopped
         op: equal
-      - *idle-14-days
     actions:
       - type: delete
         skip-snapshot: false
@@ -282,7 +283,8 @@ policies:
 
   - name: rds-cluster-idle-enforce-stopped-before-delete
     resource: rds-cluster
-    description: Before delete, ensure cluster is stopped if still available.
+    description: |
+      Two to one days before delete, stop cluster if it is still available (not on delete day).
     filters:
       - "tag:custodian_rds_idle_exempt": absent
       - "tag:custodian_rds_idle_ignore": absent
@@ -290,6 +292,12 @@ policies:
       - type: marked-for-op
         tag: c7n_rds_idle
         op: delete
+        skew: 2
+      - not:
+          - type: marked-for-op
+            tag: c7n_rds_idle
+            op: delete
+            skew: 1
       - type: value
         key: Status
         value: available
@@ -302,27 +310,36 @@ policies:
         violation_desc: "Cluster marked for deletion was still available."
         action_desc: "Cluster stopped prior to scheduled deletion."
 
-  - name: rds-cluster-idle-start-predelete-1h
+  - name: rds-cluster-idle-start-predelete-1d
     resource: rds-cluster
-    description: Start cluster one hour before scheduled deletion (Aurora pre-delete step).
+    description: |
+      Start cluster one day before scheduled deletion (Aurora pre-delete step; daily schedule).
     filters:
       - "tag:custodian_rds_idle_exempt": absent
       - "tag:custodian_rds_idle_ignore": absent
       - "tag:c7n_rds_idle": present
+      - "tag:c7n_rds_cluster_predelete_started": absent
       - type: marked-for-op
         tag: c7n_rds_idle
         op: delete
-        skew_hours: 1
+        skew: 1
+      - not:
+          - type: marked-for-op
+            tag: c7n_rds_idle
+            op: delete
       - type: value
         key: Status
         value: stopped
         op: equal
     actions:
       - start
+      - type: tag
+        tags:
+          c7n_rds_cluster_predelete_started: "true"
       - <<: *notify-base
         subject: "RDS cluster pre-delete start — {{ DBClusterIdentifier }}"
-        violation_desc: "Cluster is within one hour of scheduled idle deletion."
-        action_desc: "Cluster started for pre-delete workflow; deletion policy runs at marked time."
+        violation_desc: "Cluster is one day before scheduled idle deletion."
+        action_desc: "Cluster started for pre-delete workflow; deletion policy runs on the marked date."
 
   - name: rds-cluster-idle-delete
     resource: rds-cluster
@@ -334,7 +351,6 @@ policies:
       - type: marked-for-op
         tag: c7n_rds_idle
         op: delete
-      - *idle-14-days
     actions:
       - type: delete
         skip-snapshot: false
@@ -363,6 +379,7 @@ policies:
         tags:
           - c7n_rds_idle
           - c7n_rds_idle_7d_notice
+          - c7n_rds_cluster_predelete_started
       - <<: *notify-base
         subject: "RDS cluster idle mark cleared — {{ DBClusterIdentifier }}"
         violation_desc: "Database connections detected on cluster."

@@ -2,14 +2,14 @@
 #
 # Timeline (unused = not used on EC2/Lambda/ECS and no service last-access in 365d):
 #   1. Role age > 1 year → notify + mark delete in 21 days (c7n_iam_role_idle)
-#   2. Day 7  → second notify (marked-for-op skew 14)
+#   2. Day 7  → second notify (marked-for-op skew 14, one-shot c7n_iam_role_idle_7d_notice)
 #   3. Day 14 → disable (detach managed policies) + re-mark delete in 7 days + notify
 #   4. Day 21 → delete (force) + notify
 #
 # Mailer: mailer/mailer.example.yml
 # Opt-out: custodian_iam_role_idle_exempt | custodian_iam_role_idle_ignore
 #
-# Skips AWS service roles (Path /aws-service-role/). Inline policies removed on delete (force).
+# Skips AWS service-linked roles (Path prefix /aws-service-role/). Inline policies removed on delete (force).
 
 vars:
   notify-transport: &notify-transport
@@ -37,11 +37,11 @@ vars:
     op: greater-than
 
   not-aws-service-role: &not-aws-service-role
-    type: value
-    key: Path
-    op: not-in
-    value:
-      - /aws-service-role/
+    not:
+      - type: value
+        key: Path
+        op: glob
+        value: "/aws-service-role/*"
 
   role-used: &role-used
     type: used
@@ -87,6 +87,7 @@ policies:
       - "tag:custodian_iam_role_idle_ignore": absent
       - <<: *not-aws-service-role
       - "tag:c7n_iam_role_idle": present
+      - "tag:c7n_iam_role_idle_7d_notice": absent
       - type: marked-for-op
         tag: c7n_iam_role_idle
         op: delete
@@ -97,6 +98,9 @@ policies:
         match-operator: all
         LastAuthenticated: null
     actions:
+      - type: tag
+        tags:
+          c7n_iam_role_idle_7d_notice: "true"
       - <<: *notify-base
         subject: "IAM role unused — 7-day reminder — {{ RoleName }}"
         violation_desc: "Unused IAM role — one week into the cleanup timeline."
@@ -112,10 +116,16 @@ policies:
       - "tag:custodian_iam_role_idle_ignore": absent
       - <<: *not-aws-service-role
       - "tag:c7n_iam_role_idle": present
+      - "tag:c7n_iam_role_disabled": absent
       - type: marked-for-op
         tag: c7n_iam_role_idle
         op: delete
         skew: 7
+      - not:
+          - type: marked-for-op
+            tag: c7n_iam_role_idle
+            op: delete
+            skew: 6
       - type: used
         state: false
       - type: usage
@@ -174,6 +184,7 @@ policies:
       - or:
           - "tag:c7n_iam_role_idle": present
           - "tag:c7n_iam_role_idle_1y": present
+          - "tag:c7n_iam_role_idle_7d_notice": present
           - "tag:c7n_iam_role_disabled": present
       - <<: *role-used
     actions:
@@ -181,6 +192,7 @@ policies:
         tags:
           - c7n_iam_role_idle
           - c7n_iam_role_idle_1y
+          - c7n_iam_role_idle_7d_notice
           - c7n_iam_role_disabled
       - <<: *notify-base
         subject: "IAM role idle cleanup cancelled — {{ RoleName }}"

@@ -77,7 +77,7 @@ Staged lifecycle for **RDS instances** (standalone) and **RDS/Aurora clusters** 
 | Mark stop 14d | `rds-idle-mark-stop-14d`, `rds-cluster-idle-mark-stop-14d` | Notify + mark stop |
 | Stop → mark delete 30d | `rds-idle-stop-mark-delete-30d`, `rds-cluster-idle-stop-mark-delete-30d` | Stop, mark delete, notify |
 | Ensure stopped | `rds-idle-enforce-stopped-before-delete`, `rds-cluster-idle-enforce-stopped-before-delete` | Stop if still running |
-| Cluster pre-delete | `rds-cluster-idle-start-predelete-1h` | **Start** cluster 1h before delete |
+| Cluster pre-delete | `rds-cluster-idle-start-predelete-1d` | **Start** cluster 1 day before delete (daily schedule) |
 | Delete | `rds-idle-delete`, `rds-cluster-idle-delete` | Delete + notify |
 | Active again | `rds-idle-unmark-on-activity`, `rds-cluster-idle-unmark-on-activity` | Clear tags |
 
