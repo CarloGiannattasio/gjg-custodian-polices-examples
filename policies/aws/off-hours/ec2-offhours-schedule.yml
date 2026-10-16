@@ -1,0 +1,70 @@
+# EC2 off-hours / on-hours — opt-IN (maid_offhours tag)
+# Mailer (Slack + email): mailer/mailer.example.yml
+#
+# Schedule: onhour 8 and offhour 20 (Eastern), weekends off — split across two policies.
+# Custodian requires type: offhour filters to use only offhour (not onhour), and vice versa.
+
+vars:
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+policies:
+  - name: ec2-offhours-stop
+    resource: ec2
+    description: |
+      Stop EC2 during off-hours for instances tagged maid_offhours (opt-in mode).
+    filters:
+      - "tag:maid_offhours": present
+      - type: value
+        key: State.Name
+        value: running
+        op: equal
+      - type: offhour
+        tag: maid_offhours
+        default_tz: et
+        opt-out: false
+        offhour: 20
+        weekends: true
+    actions:
+      - stop
+      - <<: *notify-base
+        subject: "EC2 stopped (off-hours) — {{ InstanceId }} ({{ region }})"
+        violation_desc: "Instance stopped per maid_offhours schedule."
+        action_desc: "EC2 stop action completed during off-hours window."
+
+  - name: ec2-onhours-start
+    resource: ec2
+    description: |
+      Start EC2 during on-hours for instances tagged maid_offhours (opt-in mode).
+    filters:
+      - "tag:maid_offhours": present
+      - type: value
+        key: State.Name
+        value: stopped
+        op: equal
+      - type: onhour
+        tag: maid_offhours
+        default_tz: et
+        opt-out: false
+        onhour: 8
+        weekends: true
+    actions:
+      - start
+      - <<: *notify-base
+        subject: "EC2 started (on-hours) — {{ InstanceId }} ({{ region }})"
+        violation_desc: "Instance started per maid_offhours schedule."
+        action_desc: "EC2 start action completed during on-hours window."

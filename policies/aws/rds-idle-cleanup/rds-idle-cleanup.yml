@@ -1,0 +1,369 @@
+# RDS / Aurora idle cleanup lifecycle (instances + clusters)
+#
+# Timeline (idle = DatabaseConnections == 0 for the lookback window):
+#   1. 7 days idle  → notify (Slack + email), tag c7n_rds_idle_7d_notice
+#   2. Still idle   → notify + mark-for-op stop in 14 days (tag c7n_rds_idle)
+#   3. Stop date    → if still idle 14d + running, stop, re-mark delete in 30 days, notify
+#   4. Pre-delete   → ensure stopped; Aurora clusters: start 1 hour before delete time
+#   5. Delete date  → delete (instances must be stopped), notify
+#   • Unmark if connections resume
+#
+# Requires Cloud Custodian Mailer (SQS transport). Shared config: mailer/mailer.example.yml
+# Replace NOTIFY_QUEUE, SLACK_CHANNEL, and NOTIFY_EMAIL below.
+#
+# Aurora: manage clusters with rds-cluster policies; member instances are excluded from
+# instance policies via DBClusterIdentifier filter.
+#
+# Skip lifecycle when either opt-out tag is present (any value):
+#   custodian_rds_idle_exempt  |  custodian_rds_idle_ignore
+
+vars:
+  lifecycle-tag: &lifecycle-tag c7n_rds_idle
+  notice-tag: &notice-tag c7n_rds_idle_7d_notice
+
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+  idle-7-days: &idle-7-days
+    type: metrics
+    name: DatabaseConnections
+    days: 7
+    value: 0
+    op: equal
+    statistics: Sum
+
+  idle-14-days: &idle-14-days
+    type: metrics
+    name: DatabaseConnections
+    days: 14
+    value: 0
+    op: equal
+    statistics: Sum
+
+  not-in-cluster: &not-in-cluster
+    type: value
+    key: DBClusterIdentifier
+    value: absent
+
+policies:
+  # ---------------------------------------------------------------------------
+  # RDS instances (standalone — not Aurora cluster members)
+  # ---------------------------------------------------------------------------
+
+  - name: rds-idle-notify-7d
+    resource: rds
+    description: Idle 7 days — first notice via Slack and email.
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle_7d_notice": absent
+      - *idle-7-days
+    actions:
+      - type: tag
+        tags:
+          c7n_rds_idle_7d_notice: "true"
+      - <<: *notify-base
+        subject: "RDS idle 7d — {{ DBInstanceIdentifier }} ({{ region }})"
+        violation_desc: "RDS has had no database connections for 7 days."
+        action_desc: |
+          No lifecycle action yet. If usage continues to be zero, a stop will be
+          scheduled in a follow-up policy. Tag custodian_rds_idle_exempt or
+          custodian_rds_idle_ignore to opt out.
+
+  - name: rds-idle-mark-stop-14d
+    resource: rds
+    description: Notify and mark for stop in 14 days while still idle.
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle_7d_notice": present
+      - "tag:c7n_rds_idle": absent
+      - *idle-7-days
+    actions:
+      - type: mark-for-op
+        tag: c7n_rds_idle
+        op: stop
+        days: 14
+      - <<: *notify-base
+        subject: "RDS idle — stop scheduled in 14 days — {{ DBInstanceIdentifier }}"
+        violation_desc: "RDS remains idle (no connections for 7 days)."
+        action_desc: |
+          Marked for stop in 14 days (tag c7n_rds_idle). Use the database or remove
+          the mark to cancel.
+
+  - name: rds-idle-stop-mark-delete-30d
+    resource: rds
+    description: Stop after 14-day mark; re-mark for delete in 30 days if still idle.
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: stop
+      - type: value
+        key: DBInstanceStatus
+        value: available
+        op: equal
+      - *idle-14-days
+    actions:
+      - stop
+      - type: remove-tag
+        tags:
+          - c7n_rds_idle
+      - type: mark-for-op
+        tag: c7n_rds_idle
+        op: delete
+        days: 30
+      - <<: *notify-base
+        subject: "RDS stopped — deletion in 30 days — {{ DBInstanceIdentifier }}"
+        violation_desc: "RDS was running idle for 14+ days and has been stopped."
+        action_desc: |
+          Deletion scheduled in 30 days unless the instance is used or unmarked.
+
+  - name: rds-idle-enforce-stopped-before-delete
+    resource: rds
+    description: Before delete date, ensure instance is stopped (not still available).
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: delete
+      - type: value
+        key: DBInstanceStatus
+        value: available
+        op: equal
+      - *idle-14-days
+    actions:
+      - stop
+      - <<: *notify-base
+        subject: "RDS pre-delete stop — {{ DBInstanceIdentifier }}"
+        violation_desc: "RDS marked for deletion was still running."
+        action_desc: "Instance stopped prior to scheduled deletion."
+
+  - name: rds-idle-delete
+    resource: rds
+    description: Delete when marked delete date is reached and instance is stopped.
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: delete
+      - type: value
+        key: DBInstanceStatus
+        value: stopped
+        op: equal
+      - *idle-14-days
+    actions:
+      - type: delete
+        skip-snapshot: false
+      - <<: *notify-base
+        subject: "RDS deleted (idle) — {{ DBInstanceIdentifier }}"
+        violation_desc: "Idle RDS instance reached delete date and was stopped."
+        action_desc: "DB instance deleted. Adjust skip-snapshot if your org requires final snapshots."
+
+  - name: rds-idle-unmark-on-activity
+    resource: rds
+    description: Remove idle lifecycle tags when connections resume.
+    filters:
+      - *not-in-cluster
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - or:
+          - "tag:c7n_rds_idle": present
+          - "tag:c7n_rds_idle_7d_notice": present
+      - type: metrics
+        name: DatabaseConnections
+        days: 7
+        value: 0
+        op: greater-than
+    actions:
+      - type: remove-tag
+        tags:
+          - c7n_rds_idle
+          - c7n_rds_idle_7d_notice
+      - <<: *notify-base
+        subject: "RDS idle mark cleared — {{ DBInstanceIdentifier }}"
+        violation_desc: "Database connections detected after idle marking."
+        action_desc: "Lifecycle tags removed; no stop/delete scheduled."
+
+  # ---------------------------------------------------------------------------
+  # RDS / Aurora clusters
+  # ---------------------------------------------------------------------------
+
+  - name: rds-cluster-idle-notify-7d
+    resource: rds-cluster
+    description: Idle 7 days — first notice via Slack and email.
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle_7d_notice": absent
+      - *idle-7-days
+    actions:
+      - type: tag
+        tags:
+          c7n_rds_idle_7d_notice: "true"
+      - <<: *notify-base
+        subject: "RDS cluster idle 7d — {{ DBClusterIdentifier }} ({{ region }})"
+        violation_desc: "Cluster has had no database connections for 7 days."
+        action_desc: |
+          No lifecycle action yet. Further policies may schedule stop and deletion.
+
+  - name: rds-cluster-idle-mark-stop-14d
+    resource: rds-cluster
+    description: Notify and mark cluster for stop in 14 days while still idle.
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle_7d_notice": present
+      - "tag:c7n_rds_idle": absent
+      - *idle-7-days
+    actions:
+      - type: mark-for-op
+        tag: c7n_rds_idle
+        op: stop
+        days: 14
+      - <<: *notify-base
+        subject: "RDS cluster idle — stop in 14 days — {{ DBClusterIdentifier }}"
+        violation_desc: "Cluster remains idle (no connections for 7 days)."
+        action_desc: "Marked for stop in 14 days on tag c7n_rds_idle."
+
+  - name: rds-cluster-idle-stop-mark-delete-30d
+    resource: rds-cluster
+    description: Stop cluster; re-mark for delete in 30 days if still idle 14d.
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: stop
+      - type: value
+        key: Status
+        value: available
+        op: equal
+      - *idle-14-days
+    actions:
+      - stop
+      - type: remove-tag
+        tags:
+          - c7n_rds_idle
+      - type: mark-for-op
+        tag: c7n_rds_idle
+        op: delete
+        days: 30
+      - <<: *notify-base
+        subject: "RDS cluster stopped — delete in 30 days — {{ DBClusterIdentifier }}"
+        violation_desc: "Cluster was running idle 14+ days and has been stopped."
+        action_desc: "Cluster deletion scheduled in 30 days."
+
+  - name: rds-cluster-idle-enforce-stopped-before-delete
+    resource: rds-cluster
+    description: Before delete, ensure cluster is stopped if still available.
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: delete
+      - type: value
+        key: Status
+        value: available
+        op: equal
+      - *idle-14-days
+    actions:
+      - stop
+      - <<: *notify-base
+        subject: "RDS cluster pre-delete stop — {{ DBClusterIdentifier }}"
+        violation_desc: "Cluster marked for deletion was still available."
+        action_desc: "Cluster stopped prior to scheduled deletion."
+
+  - name: rds-cluster-idle-start-predelete-1h
+    resource: rds-cluster
+    description: Start cluster one hour before scheduled deletion (Aurora pre-delete step).
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: delete
+        skew_hours: 1
+      - type: value
+        key: Status
+        value: stopped
+        op: equal
+    actions:
+      - start
+      - <<: *notify-base
+        subject: "RDS cluster pre-delete start — {{ DBClusterIdentifier }}"
+        violation_desc: "Cluster is within one hour of scheduled idle deletion."
+        action_desc: "Cluster started for pre-delete workflow; deletion policy runs at marked time."
+
+  - name: rds-cluster-idle-delete
+    resource: rds-cluster
+    description: Delete cluster when delete mark matures (after pre-delete start window).
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - "tag:c7n_rds_idle": present
+      - type: marked-for-op
+        tag: c7n_rds_idle
+        op: delete
+      - *idle-14-days
+    actions:
+      - type: delete
+        skip-snapshot: false
+        delete-instances: true
+      - <<: *notify-base
+        subject: "RDS cluster deleted (idle) — {{ DBClusterIdentifier }}"
+        violation_desc: "Idle cluster reached delete date."
+        action_desc: "Cluster and member instances deleted."
+
+  - name: rds-cluster-idle-unmark-on-activity
+    resource: rds-cluster
+    description: Remove idle lifecycle tags when cluster connections resume.
+    filters:
+      - "tag:custodian_rds_idle_exempt": absent
+      - "tag:custodian_rds_idle_ignore": absent
+      - or:
+          - "tag:c7n_rds_idle": present
+          - "tag:c7n_rds_idle_7d_notice": present
+      - type: metrics
+        name: DatabaseConnections
+        days: 7
+        value: 0
+        op: greater-than
+    actions:
+      - type: remove-tag
+        tags:
+          - c7n_rds_idle
+          - c7n_rds_idle_7d_notice
+      - <<: *notify-base
+        subject: "RDS cluster idle mark cleared — {{ DBClusterIdentifier }}"
+        violation_desc: "Database connections detected on cluster."
+        action_desc: "Lifecycle tags removed."

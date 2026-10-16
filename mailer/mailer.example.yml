@@ -1,0 +1,22 @@
+# Shared Cloud Custodian Mailer config for notify actions in any policy in this repo.
+#
+# Setup:
+#   1. pip install c7n-mailer
+#   2. cp mailer/mailer.example.yml mailer/mailer.yml  (keep mailer.yml out of git if it has secrets)
+#   3. Edit queue URL, from_address, Slack webhook, and contact_tags
+#   4. c7n-mailer --config mailer/mailer.yml -t sqs --update-lambda
+#
+# Policy YAML must use the same SQS queue in notify transport (see policy vars / notify-transport).
+# Docs: https://cloudcustodian.io/docs/tools/c7n-mailer.html
+
+queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+region: us-east-1
+
+from_address: cloud-custodian@example.com
+
+slack_webhook: https://hooks.slack.com/services/XXX/YYY/ZZZ
+
+# Resolve resource-owner and other recipients from RDS/EC2 tags (adjust for your org)
+contact_tags:
+  - Resource Contact
+  - CreatorName

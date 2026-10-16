@@ -1,0 +1,40 @@
+# Shared notify variables — copy this `vars:` block into policy files (Custodian anchors are per-file).
+# Queue and mailer setup: mailer/mailer.example.yml
+#
+# vars:
+#   notify-transport: &notify-transport
+#     type: sqs
+#     queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+#     region: us-east-1
+#
+#   notify-to: &notify-to
+#     - resource-owner
+#     - slack://#cloud-custodian-alerts
+#     - cloud-custodian@example.com
+#
+#   notify-base: &notify-base
+#     type: notify
+#     template: default.html
+#     priority_header: 1
+#     to: *notify-to
+#     transport: *notify-transport
+
+vars:
+  notify-transport: &notify-transport
+    type: sqs
+    queue: https://sqs.us-east-1.amazonaws.com/123456789012/c7n-mailer
+    region: us-east-1
+
+  notify-to: &notify-to
+    - resource-owner
+    - slack://#cloud-custodian-alerts
+    - cloud-custodian@example.com
+
+  notify-base: &notify-base
+    type: notify
+    template: default.html
+    priority_header: 1
+    to: *notify-to
+    transport: *notify-transport
+
+policies: []
